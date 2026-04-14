@@ -1259,6 +1259,29 @@ fn in_place_edit_replace() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Regression test for upstream issues #165 and #229: `sed -i SCRIPT FILE`
+/// used to consume SCRIPT as the backup SUFFIX and then try to compile FILE
+/// as a sed program, producing cryptic parser errors like `extra characters
+/// at the end of the d command`. After the fix, the detached form must leave
+/// SCRIPT as the script and FILE as the input.
+#[test]
+fn in_place_edit_detached_form_treats_positional_as_script() -> std::io::Result<()> {
+    let mut temp = NamedTempFile::new()?;
+    writeln!(temp.as_file_mut(), "hello, world")?;
+    let path = temp.path().to_path_buf();
+    let temp_path = temp.into_temp_path();
+
+    new_ucmd!()
+        .args(&["-i", "s/world/universe/", path.to_str().unwrap()])
+        .succeeds();
+
+    let actual = std::fs::read_to_string(&path)?;
+    assert_eq!(actual, "hello, universe\n");
+
+    temp_path.close()?;
+    Ok(())
+}
+
 #[test]
 fn in_place_edit_backup() -> std::io::Result<()> {
     let mut temp = NamedTempFile::new()?;
@@ -1269,13 +1292,7 @@ fn in_place_edit_backup() -> std::io::Result<()> {
 
     // Run the sed-like command with -i (in-place edit)
     new_ucmd!()
-        .args(&[
-            "-i",
-            ".bak",
-            "-e",
-            "s/world/universe/",
-            path.to_str().unwrap(),
-        ])
+        .args(&["-i.bak", "-e", "s/world/universe/", path.to_str().unwrap()])
         .succeeds();
 
     // Read edited file
@@ -1369,8 +1386,7 @@ fn in_place_edit_follow_symlink_with_backup() -> Result<(), Box<dyn std::error::
     new_ucmd!()
         .args(&[
             "--follow-symlinks",
-            "-i",
-            ".bak",
+            "-i.bak",
             "-e",
             "s/world/universe/",
             link.path().to_str().unwrap(),
@@ -1405,8 +1421,7 @@ fn in_place_edit_symlink_replaced_with_backup() -> Result<(), Box<dyn std::error
 
     new_ucmd!()
         .args(&[
-            "-i",
-            ".bak",
+            "-i.bak",
             "-e",
             "s/world/universe/",
             link.path().to_str().unwrap(),

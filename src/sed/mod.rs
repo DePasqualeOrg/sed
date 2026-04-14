@@ -35,7 +35,7 @@ const USAGE: &str = "sed [OPTION]... [script] [file]...";
 
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
-    let matches = uu_app().try_get_matches_from(args)?;
+    let matches = uu_app().try_get_matches_from(preprocess_in_place_suffix(args))?;
 
     // Don't use arg_required_else_help when declaring command
     // as it exits with code 2 and we use it to check
@@ -51,6 +51,48 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let executable = compile(scripts, &mut context)?;
     process_all_files(executable, files, &mut context)?;
     Ok(())
+}
+
+// Rewrites `-iSUFFIX` (short option with attached suffix, no `=`) into
+// `-i=SUFFIX` so the `in-place` Arg still accepts the GNU short attached
+// form. The Arg uses `require_equals(true)`, which stops clap from
+// greedily consuming the next positional as SUFFIX but also rejects the
+// attached short form; the rewrite restores that form. Leaves `-i`,
+// `-i=SUFFIX`, `--in-place`, and `--in-place=SUFFIX` alone, and does not
+// touch args appearing after a `--` terminator.
+//
+// Matching GNU sed, `-i` does not participate in short-option stacking:
+// `-iE` is parsed as `-i` with SUFFIX `E`, not as `-i -E`. Callers that
+// want both `-i` and `-E` must spell them as separate tokens.
+//
+// Non-UTF-8 args pass through untouched: `matches.get_one::<String>(
+// "in-place")` in `build_context` would reject them anyway, so there's
+// nothing to be gained by rewriting them at this layer.
+fn preprocess_in_place_suffix(args: impl uucore::Args) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    let mut out: Vec<OsString> = Vec::new();
+    let mut past_terminator = false;
+    for arg in args {
+        if past_terminator {
+            out.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            past_terminator = true;
+            out.push(arg);
+            continue;
+        }
+        if let Some(s) = arg.to_str()
+            && let Some(suffix) = s.strip_prefix("-i")
+            && !suffix.is_empty()
+            && !suffix.starts_with('=')
+        {
+            out.push(OsString::from(format!("-i={suffix}")));
+            continue;
+        }
+        out.push(arg);
+    }
+    out
 }
 
 #[allow(clippy::cognitive_complexity)]
@@ -98,11 +140,20 @@ pub fn uu_app() -> Command {
                 .help("Follow symlinks when processing in place.")
                 .action(clap::ArgAction::SetTrue),
             // Access with .get_one::<String>("in-place")
+            //
+            // `require_equals(true)` prevents clap from greedily consuming
+            // the next positional as SUFFIX, which would otherwise turn
+            // `sed -i 's/foo/bar/' file` into `-i 's/foo/bar/'` (SUFFIX) +
+            // `file` as the script, causing parser errors. The short attached
+            // form `-iSUFFIX` (without `=`) is preserved via the argv
+            // preprocessor in `uumain`, which rewrites `-iSUFFIX` to
+            // `-i=SUFFIX` before clap sees the args.
             Arg::new("in-place")
                 .short('i')
                 .long("in-place")
                 .help("Edit files in place, making a backup if SUFFIX is supplied.")
                 .num_args(0..=1)
+                .require_equals(true)
                 .default_missing_value(""),
             // Access with .get_one::<u32>("line-length")
             arg!(-l --length <NUM> "Specify the 'l' command line-wrap length.")
@@ -398,13 +449,155 @@ mod tests {
         assert!(ctx.regex_extended);
     }
 
+    // Helper matching what uumain does: preprocess args, then parse with clap.
+    // Needed because `test_matches` calls `uu_app().get_matches_from(...)`
+    // directly, which bypasses the `-iSUFFIX` → `-i=SUFFIX` rewriting.
+    fn test_matches_preprocessed(args: &[&str]) -> ArgMatches {
+        use std::ffi::OsString;
+        let argv: Vec<OsString> = std::iter::once(OsString::from("sed"))
+            .chain(args.iter().map(OsString::from))
+            .collect();
+        uu_app().get_matches_from(preprocess_in_place_suffix(argv.into_iter()))
+    }
+
     #[test]
-    fn test_in_place_with_suffix() {
-        let matches = test_matches(&["-i", ".bak"]);
+    fn test_in_place_with_attached_short_suffix() {
+        // `-iSUFFIX` (attached, no `=`) is the GNU form. The argv preprocessor
+        // rewrites it to `-i=SUFFIX` so clap accepts it.
+        let matches = test_matches_preprocessed(&["-i.bak"]);
         let ctx = build_context(&matches);
 
         assert!(ctx.in_place);
         assert_eq!(ctx.in_place_suffix, Some(".bak".to_string()));
+    }
+
+    #[test]
+    fn test_in_place_with_equals_suffix() {
+        let matches = test_matches_preprocessed(&["-i=.bak"]);
+        let ctx = build_context(&matches);
+
+        assert!(ctx.in_place);
+        assert_eq!(ctx.in_place_suffix, Some(".bak".to_string()));
+
+        let matches = test_matches_preprocessed(&["--in-place=.bak"]);
+        let ctx = build_context(&matches);
+
+        assert!(ctx.in_place);
+        assert_eq!(ctx.in_place_suffix, Some(".bak".to_string()));
+    }
+
+    #[test]
+    fn test_in_place_bare_has_no_suffix() {
+        let matches = test_matches_preprocessed(&["-i"]);
+        let ctx = build_context(&matches);
+
+        assert!(ctx.in_place);
+        assert_eq!(ctx.in_place_suffix, None);
+    }
+
+    #[test]
+    fn test_in_place_detached_suffix_is_rejected() {
+        // `-i SUFFIX` (space-separated) must not consume SUFFIX as the backup
+        // extension. Here, `-i` takes no value (default_missing_value = "") and
+        // `s/foo/bar/` falls through to the `[script]` positional, with
+        // `file.txt` as the file. This is the primary bug being fixed: without
+        // `require_equals`, clap would greedily consume `s/foo/bar/` as SUFFIX
+        // and then try to compile `file.txt` as a sed script.
+        let matches = test_matches_preprocessed(&["-i", "s/foo/bar/", "file.txt"]);
+        let (scripts, files) = get_scripts_files(&matches).expect("should succeed");
+
+        assert_eq!(
+            scripts,
+            vec![ScriptValue::StringVal("s/foo/bar/".to_string())]
+        );
+        assert_eq!(files, vec![PathBuf::from("file.txt")]);
+
+        let ctx = build_context(&matches);
+        assert!(ctx.in_place);
+        assert_eq!(ctx.in_place_suffix, None);
+    }
+
+    #[test]
+    fn test_in_place_equals_with_empty_suffix_behaves_like_bare_i() {
+        // `-i=` reaches clap untouched (the preprocessor leaves `-i=*` alone
+        // because `bytes[2] == b'='`). clap accepts `-i=` as `in-place` with
+        // value `""`, and `build_context` folds an empty SUFFIX string back
+        // to `None` — so `-i=` is equivalent to bare `-i` (in-place edit with
+        // no backup). Pinned here so a future preprocessor or clap tweak
+        // can't silently drift this behavior.
+        let matches = test_matches_preprocessed(&["-i=", "s/a/b/", "file.txt"]);
+        let ctx = build_context(&matches);
+
+        assert!(ctx.in_place);
+        assert_eq!(ctx.in_place_suffix, None);
+    }
+
+    #[test]
+    fn test_in_place_attached_letter_suffix_is_not_stacked() {
+        // `-iE` must be treated as `-i` with SUFFIX `E`, not as `-i -E`,
+        // matching GNU sed. The preprocessor rewrites `-iE` to `-i=E`;
+        // `-E` (regexp-extended) stays off.
+        let matches = test_matches_preprocessed(&["-iE"]);
+        let ctx = build_context(&matches);
+
+        assert!(ctx.in_place);
+        assert_eq!(ctx.in_place_suffix, Some("E".to_string()));
+        assert!(!ctx.regex_extended);
+    }
+
+    #[test]
+    fn test_preprocess_leaves_other_short_options_alone() {
+        // The preprocessor must only touch args beginning with `-i`. Other
+        // short options, including short-option stacks like `-En`, must
+        // reach clap verbatim.
+        use std::ffi::OsString;
+        let argv: Vec<OsString> = ["sed", "-En", "s/a/b/", "file.txt"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let out: Vec<String> = preprocess_in_place_suffix(argv.into_iter())
+            .into_iter()
+            .map(|s| s.into_string().unwrap())
+            .collect();
+        assert_eq!(out, vec!["sed", "-En", "s/a/b/", "file.txt"]);
+
+        let matches = test_matches_preprocessed(&["-En", "s/a/b/", "file.txt"]);
+        let ctx = build_context(&matches);
+        assert!(ctx.regex_extended);
+        assert!(ctx.quiet);
+    }
+
+    #[test]
+    fn test_preprocess_rewrites_i_dot_bak_before_terminator() {
+        // Positive counterpart to the terminator test: `-i.bak` appearing
+        // before `--` still gets rewritten. Pins the "rewrite applies up
+        // to `--`, stops after" behavior.
+        use std::ffi::OsString;
+        let argv: Vec<OsString> = ["sed", "-i.bak", "--", "-i.keep"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let out: Vec<String> = preprocess_in_place_suffix(argv.into_iter())
+            .into_iter()
+            .map(|s| s.into_string().unwrap())
+            .collect();
+        assert_eq!(out, vec!["sed", "-i=.bak", "--", "-i.keep"]);
+    }
+
+    #[test]
+    fn test_preprocess_does_not_touch_args_after_terminator() {
+        // `-iFOO` appearing after `--` must be left alone (it's a positional
+        // file, not an option). This matches standard POSIX argv handling.
+        use std::ffi::OsString;
+        let argv: Vec<OsString> = ["sed", "s/a/b/", "--", "-i.bak"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let out: Vec<String> = preprocess_in_place_suffix(argv.into_iter())
+            .into_iter()
+            .map(|s| s.into_string().unwrap())
+            .collect();
+        assert_eq!(out, vec!["sed", "s/a/b/", "--", "-i.bak"]);
     }
 
     #[test]
