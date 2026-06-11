@@ -157,3 +157,8 @@ unnested_or_patterns = "allow"
 restriction = { level = "allow", priority = -1 }
 cognitive_complexity = "warn"
 redundant_clone = "warn"
+
+# wasip2: vendored copy of uucore 0.9.0 with the feature(wasip2) crate attribute,
+# needed until a uucore release gates std::os::wasi for wasm32-wasip2.
+[patch.crates-io]
+uucore = { path = "local-deps/uucore" }
