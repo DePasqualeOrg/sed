@@ -58,6 +58,7 @@ pub struct MmapLineCursor<'a> {
     fast_copy: FastCopy, // Data for fast file copy I/O
     data: &'a [u8],      // Mmapped data
     pos: usize,          // Position within the data
+    separator: u8,       // Line terminator: \n, or \0 with -z
 }
 
 #[cfg(unix)]
@@ -69,12 +70,13 @@ pub struct NextMmapLine<'a> {
 
 #[cfg(unix)]
 impl<'a> MmapLineCursor<'a> {
-    fn new(file: File, data: &'a [u8]) -> Self {
+    fn new(file: File, data: &'a [u8], separator: u8) -> Self {
         Self {
             fast_copy: FastCopy::new(&file),
             _file: file,
             data,
             pos: 0,
+            separator,
         }
     }
 
@@ -86,19 +88,19 @@ impl<'a> MmapLineCursor<'a> {
 
         let start = self.pos;
 
-        let mut end = if let Some(pos) = memchr(b'\n', &self.data[start..]) {
+        let mut end = if let Some(pos) = memchr(self.separator, &self.data[start..]) {
             pos + start
         } else {
             self.data.len()
         };
 
         if end < self.data.len() {
-            end += 1; // include \n in full span
+            end += 1; // include the separator in full span
         }
 
         self.pos = end;
         let full_span = &self.data[start..end];
-        let content = if full_span.ends_with(b"\n") {
+        let content = if full_span.last() == Some(&self.separator) {
             &full_span[..full_span.len() - 1]
         } else {
             full_span
@@ -117,28 +119,30 @@ impl<'a> MmapLineCursor<'a> {
 pub struct ReadLineCursor {
     reader: Box<dyn BufRead>,
     buffer: Vec<u8>,
+    separator: u8, // Line terminator: \n, or \0 with -z
 }
 
 impl ReadLineCursor {
     /// Construct from anything that implements `Read`.
-    fn new<R: Read + 'static>(r: R) -> Self {
+    fn new<R: Read + 'static>(r: R, separator: u8) -> Self {
         let buf = BufReader::new(r);
         Self {
             reader: Box::new(buf),
             buffer: Vec::new(),
+            separator,
         }
     }
 
-    /// If a line is available, return it and its \n termination.
+    /// If a line is available, return it and its separator termination.
     fn get_line(&mut self) -> io::Result<Option<(Vec<u8>, bool)>> {
         self.buffer.clear();
-        // read_line *includes* the '\n' if present
-        let bytes_read = self.reader.read_until(b'\n', &mut self.buffer)?;
+        // read_until *includes* the separator if present
+        let bytes_read = self.reader.read_until(self.separator, &mut self.buffer)?;
         if bytes_read == 0 {
             return Ok(None);
         }
-        // O(1) check whether it ended in '\n'
-        let has_newline = self.buffer.ends_with(b"\n");
+        // O(1) check whether it ended in the separator
+        let has_newline = self.buffer.last() == Some(&self.separator);
         // strip it if you don’t want to expose it to the caller
         if has_newline {
             self.buffer.pop();
@@ -171,6 +175,11 @@ impl<'a> IOChunk<'a> {
         }
     }
 
+    /// Construct an Owned IOChunk, optionally terminated by the line separator.
+    pub fn from_bytes(content: Vec<u8>, has_newline: bool) -> Self {
+        Self::from_content(IOChunkContent::new_owned(content, has_newline))
+    }
+
     /// Clear the object's contents, converting it into Owned if needed.
     pub fn clear(&mut self) {
         self.utf8_verified.set(true);
@@ -195,18 +204,14 @@ impl<'a> IOChunk<'a> {
         self.content.len() == 0
     }
 
-    /// Return true if the content ends with a newline.
+    /// Return true if the content was terminated by the line separator.
     pub fn is_newline_terminated(&self) -> bool {
         match &self.content {
             IOChunkContent::Owned { has_newline, .. } => *has_newline,
             #[cfg(unix)]
-            IOChunkContent::MmapInput { full_span, .. } => {
-                if let Some(&last) = full_span.last() {
-                    last == b'\n'
-                } else {
-                    false
-                }
-            }
+            IOChunkContent::MmapInput {
+                content, full_span, ..
+            } => full_span.len() > content.len(),
         }
     }
 
@@ -290,7 +295,7 @@ impl<'a> IOChunk<'a> {
             IOChunkContent::MmapInput {
                 content, full_span, ..
             } => {
-                let has_newline = full_span.last().copied() == Some(b'\n');
+                let has_newline = full_span.len() > content.len();
                 self.content = IOChunkContent::new_owned(content.to_vec(), has_newline);
                 self.utf8_verified.set(false);
                 Ok(())
@@ -452,21 +457,25 @@ pub enum LineReader<'a> {
 }
 
 /// Return a LineReader that uses the ReadInput method fot the specified file.
-fn line_reader_read_input(file: File) -> io::Result<LineReader<'static>> {
+fn line_reader_read_input(file: File, separator: u8) -> io::Result<LineReader<'static>> {
     let boxed: Box<dyn Read> = Box::new(file);
     let reader = BufReader::new(boxed);
-    Ok(LineReader::ReadInput(ReadLineCursor::new(reader)))
+    Ok(LineReader::ReadInput(ReadLineCursor::new(
+        reader, separator,
+    )))
 }
 
 impl<'a> LineReader<'a> {
-    /// Open the specified file for line input.
+    /// Open the specified file for input of lines ending with `separator`.
     // Use "-" to read from the standard input.
-    pub fn open(path: &PathBuf) -> io::Result<Self> {
+    pub fn open(path: &PathBuf, separator: u8) -> io::Result<Self> {
         if path.as_os_str() == "-" {
             let stdin = io::stdin();
             let boxed: Box<dyn Read> = Box::new(stdin.lock());
             let reader = BufReader::new(boxed);
-            return Ok(LineReader::ReadInput(ReadLineCursor::new(reader)));
+            return Ok(LineReader::ReadInput(ReadLineCursor::new(
+                reader, separator,
+            )));
         }
 
         let file = File::open(path)?;
@@ -479,20 +488,20 @@ impl<'a> LineReader<'a> {
                     let slice: &'static [u8] = unsafe {
                         std::slice::from_raw_parts(mapped_file.as_ptr(), mapped_file.len())
                     };
-                    let cursor = MmapLineCursor::new(file, slice);
+                    let cursor = MmapLineCursor::new(file, slice, separator);
                     Ok(LineReader::MmapInput {
                         mapped_file,
                         cursor,
                     })
                 }
                 // Fallback to ReadInput
-                Err(_) => line_reader_read_input(file),
+                Err(_) => line_reader_read_input(file, separator),
             }
         }
 
         #[cfg(not(unix))]
         {
-            line_reader_read_input(file)
+            line_reader_read_input(file, separator)
         }
     }
 
@@ -500,7 +509,7 @@ impl<'a> LineReader<'a> {
     #[cfg(test)]
     pub fn open_stream(path: &PathBuf) -> io::Result<Self> {
         let file = File::open(path)?;
-        line_reader_read_input(file)
+        line_reader_read_input(file, b'\n')
     }
 
     /// Return the next line, if available.
@@ -592,9 +601,10 @@ pub struct OutputBuffer {
     max_pending_write: usize,       // Max bytes to keep before flushing
     #[cfg(unix)]
     mmap_chunk: Option<MmapOutput>, // Chunk to write
-    // True when the last write didn't end with \n; the \n is deferred so
-    // that commands like `p` don't emit a spurious newline under -n.
+    // True when the last write didn't end with the separator; it is deferred
+    // so that commands like `p` don't emit a spurious newline under -n.
     pending_newline: bool,
+    separator: u8, // Line terminator: \n, or \0 with -z
     #[cfg(test)]
     low_level_flushes: usize, // Number of system call flushes
 }
@@ -628,6 +638,7 @@ impl OutputBuffer {
         Self {
             out: BufWriter::new(w),
             pending_newline: false,
+            separator: b'\n',
             #[cfg(test)]
             low_level_flushes: 0,
         }
@@ -647,12 +658,30 @@ impl OutputBuffer {
             max_pending_write,
             mmap_chunk: None,
             pending_newline: false,
+            separator: b'\n',
             #[cfg(test)]
             low_level_flushes: 0,
         }
     }
 
-    /// Schedule the specified String or &str for eventual output
+    /// Terminate output lines with `separator` instead of \n.
+    #[must_use]
+    pub fn with_separator(mut self, separator: u8) -> Self {
+        self.separator = separator;
+        self
+    }
+
+    /// Continue the output of `previous`, which wrote to the same stream,
+    /// including a separator it deferred.
+    #[must_use]
+    pub fn continuing(mut self, previous: &Self) -> Self {
+        self.separator = previous.separator;
+        self.pending_newline = previous.pending_newline;
+        self
+    }
+
+    /// Schedule the specified String or &str for eventual output.
+    /// A trailing \n stands for the line separator.
     pub fn write_str<S: Into<String>>(&mut self, s: S) -> io::Result<()> {
         let mut s = s.into();
         let has_newline = s.ends_with('\n');
@@ -666,6 +695,7 @@ impl OutputBuffer {
     }
 
     /// Schedule the specified bytes for eventual output.
+    /// A trailing \n stands for the line separator.
     pub fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
         let (content, has_newline) = if bytes.ends_with(b"\n") {
             (&bytes[..bytes.len() - 1], true)
@@ -678,8 +708,12 @@ impl OutputBuffer {
         )))
     }
 
-    /// Schedule the specified text for output unchanged, after any
-    /// deferred newline.
+    /// Schedule bytes followed by the line separator.
+    pub fn write_line(&mut self, content: &[u8]) -> io::Result<()> {
+        self.write_chunk(&IOChunk::from_bytes(content.to_vec(), true))
+    }
+
+    /// Write bytes unchanged after any deferred separator.
     pub fn write_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.flush_pending_newline()?;
         #[cfg(unix)]
@@ -734,7 +768,7 @@ impl OutputBuffer {
 
         if self.pending_newline {
             self.flush_mmap(WriteRange::Complete)?;
-            self.out.write_all(b"\n")?;
+            self.out.write_all(&[self.separator])?;
             self.pending_newline = false;
         }
 
@@ -794,7 +828,7 @@ impl OutputBuffer {
                 self.flush_mmap(WriteRange::Complete)?;
                 self.out.write_all(content)?;
                 if *has_newline {
-                    self.out.write_all(b"\n")?;
+                    self.out.write_all(&[self.separator])?;
                 }
                 self.pending_newline = !has_newline;
             }
@@ -845,11 +879,11 @@ impl OutputBuffer {
         Ok(())
     }
 
-    /// Write a deferred newline if the last output didn't end with one.
+    /// Write a deferred separator if the last output didn't end with one.
     pub fn flush_pending_newline(&mut self) -> io::Result<()> {
         if self.pending_newline {
             self.flush_mmap(WriteRange::Complete)?;
-            self.out.write_all(b"\n")?;
+            self.out.write_all(&[self.separator])?;
             self.pending_newline = false;
         }
         Ok(())
@@ -871,7 +905,7 @@ impl OutputBuffer {
         }
 
         if self.pending_newline {
-            self.out.write_all(b"\n")?;
+            self.out.write_all(&[self.separator])?;
             self.pending_newline = false;
         }
 
@@ -883,7 +917,7 @@ impl OutputBuffer {
             } => {
                 self.out.write_all(content)?;
                 if *has_newline {
-                    self.out.write_all(b"\n")?;
+                    self.out.write_all(&[self.separator])?;
                 }
                 self.pending_newline = !has_newline;
                 Ok(())
@@ -891,10 +925,10 @@ impl OutputBuffer {
         }
     }
 
-    /// Write a deferred newline if the last output didn't end with one.
+    /// Write a deferred separator if the last output didn't end with one.
     pub fn flush_pending_newline(&mut self) -> io::Result<()> {
         if self.pending_newline {
-            self.out.write_all(b"\n")?;
+            self.out.write_all(&[self.separator])?;
             self.pending_newline = false;
         }
         Ok(())
@@ -1069,7 +1103,7 @@ pub fn main() -> io::Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| "-".into());
-    let mut reader = LineReader::open(&path)?;
+    let mut reader = LineReader::open(&path, b'\n')?;
     let stdout = Box::new(io::stdout().lock());
     let mut output = OutputBuffer::new(stdout);
 
@@ -1150,7 +1184,7 @@ mod tests {
         let input_path = input.path().to_path_buf();
 
         // Open the reader on that file
-        let mut reader = LineReader::open(&input_path)?;
+        let mut reader = LineReader::open(&input_path, b'\n')?;
 
         // Prepare an output temp file and wrap it in our OutputBuffer
         let output = NamedTempFile::new()?;
@@ -1186,7 +1220,7 @@ mod tests {
         input.write_all(data)?;
         input.flush()?;
         let input_path = input.path().to_path_buf();
-        let mut reader = LineReader::open(&input_path)?;
+        let mut reader = LineReader::open(&input_path, b'\n')?;
 
         // Prepare an empty output file
         let output = NamedTempFile::new()?;
@@ -1238,7 +1272,7 @@ mod tests {
         let input_path = input.path().to_path_buf();
 
         // Open reader on input file:
-        let mut reader = LineReader::open(&input_path)?;
+        let mut reader = LineReader::open(&input_path, b'\n')?;
 
         // Create the output temp file (empty):
         let output = NamedTempFile::new()?;
@@ -1277,7 +1311,7 @@ mod tests {
         let input_path = input.path().to_path_buf();
 
         // Open reader on input file:
-        let mut reader = LineReader::open(&input_path)?;
+        let mut reader = LineReader::open(&input_path, b'\n')?;
 
         // Create the output temp file (empty):
         let output = NamedTempFile::new()?;
@@ -1312,7 +1346,7 @@ mod tests {
         let input_path = input.path().to_path_buf();
 
         // Open reader on input file:
-        let mut reader = LineReader::open(&input_path)?;
+        let mut reader = LineReader::open(&input_path, b'\n')?;
 
         // Create the output temp file (empty):
         let output = NamedTempFile::new()?;
@@ -1389,7 +1423,7 @@ mod tests {
         let input_path = input.path().to_path_buf();
 
         // Open reader on input file:
-        let mut reader = LineReader::open(&input_path)?;
+        let mut reader = LineReader::open(&input_path, b'\n')?;
 
         // Create the output temp file (empty):
         let output = NamedTempFile::new()?;
@@ -1488,7 +1522,7 @@ mod tests {
         tmp.flush()?;
 
         let path = tmp.path().to_path_buf();
-        let mut reader = LineReader::open(&path)?;
+        let mut reader = LineReader::open(&path, b'\n')?;
 
         // Verify the reader's operation
         if let Some(IOChunk {
@@ -1984,6 +2018,7 @@ mod tests {
             #[cfg(unix)]
             mmap_chunk: None,
             pending_newline: false,
+            separator: b'\n',
             low_level_flushes: 0,
         };
         (buf, file)
@@ -2000,7 +2035,8 @@ mod tests {
                     block_size: 1,
                 },
                 base: bytes.as_ptr(),
-                content: bytes,
+                // As from get_line(): the content excludes the newline.
+                content: bytes.strip_suffix(b"\n").unwrap_or(bytes),
                 full_span: bytes,
             },
         }

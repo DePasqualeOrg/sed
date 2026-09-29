@@ -54,7 +54,7 @@ pub struct ProcessingContext {
     pub last_file: bool,
     /// Stop processing further input.
     pub stop_processing: bool,
-    /// Stop without writing a missing final newline (`Q`).
+    /// Stop without writing a missing final separator (`Q`).
     pub quit_silently: bool,
     /// Whether sed operates on bytes or UTF-8 characters
     pub character_mode: CharacterMode,
@@ -79,6 +79,13 @@ pub struct ProcessingContext {
     pub substitution_made: bool,
     /// Elements to append at the end of each command processing cycle
     pub append_elements: Vec<AppendElement>,
+}
+
+impl ProcessingContext {
+    /// Return the byte that terminates input and output lines.
+    pub fn separator(&self) -> u8 {
+        if self.null_data { b'\0' } else { b'\n' }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -406,7 +413,7 @@ pub enum NextLine {
     /// Replace the pattern space with the line (`n`)
     Replace,
     /// Append the line, after a newline, to these contents (`N`)
-    Append(Vec<u8>),
+    Append { contents: Vec<u8>, terminated: bool },
 }
 
 #[cfg(test)]

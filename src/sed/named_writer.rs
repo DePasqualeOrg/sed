@@ -12,7 +12,7 @@ use crate::sed::error_handling::{ScriptLocation, runtime_error};
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -30,6 +30,7 @@ pub struct NamedWriter {
     pub path: PathBuf,
     writer: BufWriter<File>,
     location: ScriptLocation,
+    pending_separator: bool, // The last line written lacked its separator
 }
 
 impl NamedWriter {
@@ -49,6 +50,7 @@ impl NamedWriter {
             path,
             writer: BufWriter::new(file),
             location,
+            pending_separator: false,
         }));
 
         FLUSH_LIST.with(|list| list.borrow_mut().push(Rc::clone(&writer)));
@@ -57,27 +59,39 @@ impl NamedWriter {
 
     /// Write String to the file, possibly with a newline, returning errors.
     pub fn write_line(&mut self, line: &str, newline: bool) -> UResult<()> {
-        self.write_line_bytes(line.as_bytes(), newline)
+        self.write_line_bytes(line.as_bytes(), b'\n', newline)
     }
 
-    /// Write bytes to the file, possibly with a newline, returning errors.
-    pub fn write_line_bytes(&mut self, line: &[u8], newline: bool) -> UResult<()> {
-        self.writer
-            .write_all(line)
-            .and_then(|()| {
-                if newline {
-                    self.writer.write_all(b"\n")
-                } else {
-                    Ok(())
-                }
-            })
-            .map_err(|e| {
-                runtime_error::<()>(
-                    &self.location,
-                    format!("writing to file {}: {e}", self.path.quote()),
-                )
-                .unwrap_err()
-            })
+    /// Write bytes to the file, possibly followed by `separator`, returning
+    /// errors. A missing separator is written before any further line.
+    pub fn write_line_bytes(
+        &mut self,
+        line: &[u8],
+        separator: u8,
+        terminated: bool,
+    ) -> UResult<()> {
+        if line.is_empty() && !terminated {
+            return Ok(());
+        }
+        let pending = std::mem::replace(&mut self.pending_separator, !terminated);
+        let writer = &mut self.writer;
+        (|| -> io::Result<()> {
+            if pending {
+                writer.write_all(&[separator])?;
+            }
+            writer.write_all(line)?;
+            if terminated {
+                writer.write_all(&[separator])?;
+            }
+            Ok(())
+        })()
+        .map_err(|e| {
+            runtime_error::<()>(
+                &self.location,
+                format!("writing to file {}: {e}", self.path.quote()),
+            )
+            .unwrap_err()
+        })
     }
 
     /// Flush the writer, returning a descriptive error.
@@ -117,7 +131,7 @@ mod tests {
 
         writer
             .borrow_mut()
-            .write_line_bytes(b"a\xE9", true)
+            .write_line_bytes(b"a\xE9", b'\n', true)
             .unwrap();
         writer.borrow_mut().flush().unwrap();
 
@@ -132,7 +146,7 @@ mod tests {
 
         writer
             .borrow_mut()
-            .write_line_bytes(b"a\xE9", false)
+            .write_line_bytes(b"a\xE9", b'\n', false)
             .unwrap();
         writer.borrow_mut().flush().unwrap();
 

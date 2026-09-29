@@ -245,6 +245,7 @@ pub fn uu_app() -> Command {
             Arg::new("null-data")
                 .short('z')
                 .long("null-data")
+                .alias("zero-terminated")
                 .help("Separate lines by NUL characters.")
                 .action(clap::ArgAction::SetTrue),
         ])
