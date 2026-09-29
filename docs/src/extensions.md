@@ -26,6 +26,7 @@ Below is a list of these extensions and incompatibilities.
 * The `l` command can be optionally followed by the output width.
 * The `--follow-symlinks` option for in-place editing.
 * The `--sandbox` option that limits potentially destructive commands.
+* The `-z` (`--null-data`) option separates lines with NUL characters.
 * Address 0 can be used to specify an address range that is already
   active on line 1 and can finish with the specified regular expression.
 * Address steps can be specified in the form of start~step and start,~step
