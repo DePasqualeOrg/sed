@@ -257,7 +257,7 @@ fn shell_stdout(
 }
 
 /// Execute the pattern space as a shell command, replacing its contents
-/// with the command's standard output, minus one trailing newline.
+/// with the command's standard output, minus one trailing line separator.
 fn execute_pattern_as_shell_command(
     pattern: &mut IOChunk,
     command: &Command,
@@ -265,12 +265,12 @@ fn execute_pattern_as_shell_command(
 ) -> UResult<()> {
     let mut shell_out = shell_stdout(pattern.as_bytes().to_vec(), command, context)?;
     #[cfg(windows)]
-    if shell_out.ends_with(b"\r\n") {
+    if !context.null_data && shell_out.ends_with(b"\r\n") {
         // On Windows a trailing \r\n is the line terminator. Strip both.
         shell_out.truncate(shell_out.len() - 2);
     }
-    // Unix (and some Windows tools) end with a single \n. Strip it, as GNU sed does.
-    if shell_out.ends_with(b"\n") {
+    // Strip one trailing line separator, as GNU sed does.
+    if shell_out.last() == Some(&context.separator()) {
         shell_out.pop();
     }
     pattern.set_to_bytes(shell_out, pattern.is_newline_terminated());
@@ -397,9 +397,11 @@ fn substitute(
 
         // Write to file if needed.
         if let Some(ref writer) = sub.write_file {
-            writer
-                .borrow_mut()
-                .write_line_bytes(pattern.as_bytes(), pattern.is_newline_terminated())?;
+            writer.borrow_mut().write_line_bytes(
+                pattern.as_bytes(),
+                context.separator(),
+                pattern.is_newline_terminated(),
+            )?;
         }
         context.substitution_made = true;
     }
@@ -467,7 +469,7 @@ fn flush_appends(output: &mut OutputBuffer, context: &mut ProcessingContext) -> 
     for elem in &context.append_elements {
         match elem {
             AppendElement::Text(text) => {
-                output.write_bytes(text.as_ref())?;
+                output.write_raw(text.as_ref())?;
             }
             AppendElement::Path(path) => {
                 output.copy_file(path)?;
@@ -536,6 +538,19 @@ impl ListLine {
         Ok(())
     }
 
+    /// List a newline of the pattern space: with -z it is not a line
+    /// separator, so it is shown as an escape.
+    fn write_newline(
+        &mut self,
+        output: &mut OutputBuffer,
+        context: &ProcessingContext,
+    ) -> UResult<()> {
+        if context.null_data {
+            return self.write_item(output, r"\n");
+        }
+        self.write_embedded_newline(output)
+    }
+
     /// Write the current list line with an embedded newline marker.
     fn write_embedded_newline(&mut self, output: &mut OutputBuffer) -> UResult<()> {
         self.buffer.push_str("$\n");
@@ -567,9 +582,7 @@ fn list(
 ) -> UResult<()> {
     // Special case for an empty pattern space
     if line.is_empty() {
-        if line.is_newline_terminated() {
-            output.write_str("$\n")?;
-        }
+        output.write_str("$\n")?;
         return Ok(());
     }
 
@@ -579,7 +592,7 @@ fn list(
         // List non-ASCII bytes in octal.
         for &byte in line.as_bytes() {
             if byte == b'\n' {
-                list_line.write_embedded_newline(output)?;
+                list_line.write_newline(output, context)?;
                 continue;
             }
             let out_str = readable_ascii_byte(byte);
@@ -597,7 +610,7 @@ fn list(
         })?;
         for ch in line.chars() {
             if ch == '\n' {
-                list_line.write_embedded_newline(output)?;
+                list_line.write_newline(output, context)?;
                 continue;
             }
             let out_str = readable_char(ch);
@@ -656,7 +669,7 @@ fn process_file(
             if let Some(action) = context.input_action.take() {
                 // Continue processing the `N` command.
                 let mut combined_lines = action.prepend;
-                combined_lines.push(b'\n');
+                combined_lines.push(context.separator());
                 combined_lines.extend_from_slice(pattern.as_bytes());
 
                 pattern.set_to_bytes(combined_lines, pattern.is_newline_terminated());
@@ -720,8 +733,8 @@ fn process_file(
                     break;
                 }
                 'D' => {
-                    // Delete up to \n and start a new cycle without new input.
-                    if let Some(pos) = memchr(b'\n', pattern.as_bytes()) {
+                    // Delete up to the first separator and start a new cycle without new input.
+                    if let Some(pos) = memchr(context.separator(), pattern.as_bytes()) {
                         let (s, _) = pattern.fields_mut()?;
                         s.drain(..=pos);
                         current.clone_from(&commands);
@@ -737,24 +750,22 @@ fn process_file(
                     }
                     CommandData::Text(cmd_bytes) => {
                         let shell_out = shell_stdout(cmd_bytes.to_vec(), &command, context)?;
-                        output.write_bytes(&shell_out)?;
+                        output.write_raw(&shell_out)?;
                     }
                     _ => panic!("invalid 'e' command data"),
                 },
                 'F' => {
                     // Output current input file name.
-                    let mut bytes = context.input_name.as_os_str().as_encoded_bytes().to_vec();
-                    bytes.push(b'\n');
-                    output.write_bytes(&bytes)?;
+                    output.write_line(context.input_name.as_os_str().as_encoded_bytes())?;
                 }
                 'g' => {
                     // Replace pattern with the contents of the hold space.
                     pattern.set_to_bytes(context.hold.content.clone(), context.hold.has_newline);
                 }
                 'G' => {
-                    // Append to pattern \n followed by hold space contents.
+                    // Append to pattern a separator followed by hold space contents.
                     let (pat_content, pat_has_newline) = pattern.fields_mut()?;
-                    pat_content.push(b'\n');
+                    pat_content.push(context.separator());
                     pat_content.extend_from_slice(&context.hold.content);
                     *pat_has_newline = context.hold.has_newline;
                 }
@@ -764,8 +775,8 @@ fn process_file(
                     context.hold.has_newline = pattern.is_newline_terminated();
                 }
                 'H' => {
-                    // Append to hold \n followed by pattern space contents.
-                    context.hold.content.push(b'\n');
+                    // Append to hold a separator followed by pattern space contents.
+                    context.hold.content.push(context.separator());
                     context.hold.content.extend_from_slice(pattern.as_bytes());
                     context.hold.has_newline = pattern.is_newline_terminated();
                 }
@@ -783,13 +794,14 @@ fn process_file(
                 }
                 'N' => {
                     flush_appends(output, context)?;
-                    // Append to pattern `\n` and the next line
+                    // Append to pattern a separator and the next line
                     // Rather than reading input here, which would result
                     // in a double borrow on reader, modify the action
                     // to perform when the next line is read.
                     context.input_action = Some(InputAction {
                         next_command: command.next.clone(),
                         prepend: pattern.as_bytes().to_vec(),
+                        terminated: pattern.is_newline_terminated(),
                     });
                     continue 'lines;
                 }
@@ -798,8 +810,8 @@ fn process_file(
                 }
                 'P' => {
                     let line = pattern.as_bytes();
-                    if let Some(pos) = memchr(b'\n', line) {
-                        output.write_bytes(&line[..=pos])?;
+                    if let Some(pos) = memchr(context.separator(), line) {
+                        output.write_line(&line[..pos])?;
                     } else {
                         write_chunk(output, context, &pattern)?;
                     }
@@ -818,13 +830,14 @@ fn process_file(
                         i32::try_from(*extract_variant!(command, Number)).unwrap_or(i32::MAX),
                     );
                     context.stop_processing = true;
+                    context.quit_silently = true;
                     context.quiet = true;
                     break;
                 }
                 'R' => {
                     // Queue the file's next line for output at end of cycle.
                     let reader = extract_variant!(command, NamedReader);
-                    if let Some(line) = reader.borrow_mut().next_line() {
+                    if let Some(line) = reader.borrow_mut().next_line(context.separator()) {
                         context
                             .append_elements
                             .push(AppendElement::Text(line.into()));
@@ -874,23 +887,25 @@ fn process_file(
                 'w' => {
                     // Append the pattern space to the specified file.
                     let writer = extract_variant!(command, NamedWriter);
-                    writer
-                        .borrow_mut()
-                        .write_line_bytes(pattern.as_bytes(), pattern.is_newline_terminated())?;
+                    writer.borrow_mut().write_line_bytes(
+                        pattern.as_bytes(),
+                        context.separator(),
+                        pattern.is_newline_terminated(),
+                    )?;
                 }
                 'W' => {
                     // Append only the first line of the pattern space.
                     let writer = extract_variant!(command, NamedWriter);
                     let pattern_bytes = pattern.as_bytes();
-                    let (first_line, found_newline) =
-                        match pattern_bytes.iter().position(|&b| b == b'\n') {
-                            // A slice including the newline
-                            Some(pos) => (&pattern_bytes[..=pos], true),
-                            None => (pattern_bytes, false),
-                        };
+                    let (first_line, terminated) = match memchr(context.separator(), pattern_bytes)
+                    {
+                        Some(pos) => (&pattern_bytes[..pos], true),
+                        None => (pattern_bytes, pattern.is_newline_terminated()),
+                    };
                     writer.borrow_mut().write_line_bytes(
                         first_line,
-                        !found_newline && pattern.is_newline_terminated(),
+                        context.separator(),
+                        terminated,
                     )?;
                 }
                 'x' => {
@@ -934,7 +949,9 @@ fn process_file(
         flush_appends(output, context)?;
 
         if context.stop_processing {
-            output.flush_pending_newline()?;
+            if !context.quit_silently {
+                output.flush_pending_newline()?;
+            }
             break;
         }
     }
@@ -945,12 +962,8 @@ fn process_file(
         && let Some(action) = context.input_action.take()
         && !context.quiet
     {
-        let mut pending = action.prepend;
-        pending.push(b'\n');
-        output.write_bytes(&pending)?;
-        if context.unbuffered {
-            output.flush()?;
-        }
+        let pending = IOChunk::from_bytes(action.prepend, action.terminated);
+        write_chunk(output, context, &pending)?;
     }
 
     Ok(())
@@ -984,7 +997,7 @@ pub fn process_all_files(
 
     for (index, path) in files.into_iter().enumerate() {
         context.last_file = index == last_file_index;
-        let mut reader = LineReader::open(&path)
+        let mut reader = LineReader::open(&path, context.separator())
             .map_err_context(|| format!("error opening input file {}", path.quote()))?;
         let output = in_place.begin(&path)?;
 
@@ -1006,9 +1019,8 @@ pub fn process_all_files(
             && !context.quiet
             && let Some(action) = context.input_action.take()
         {
-            let mut pending = action.prepend;
-            pending.push(b'\n');
-            output.write_bytes(&pending)?;
+            let pending = IOChunk::from_bytes(action.prepend, action.terminated);
+            write_chunk(output, context, &pending)?;
         }
 
         in_place.end()?;
@@ -1135,7 +1147,7 @@ mod tests {
 
         let mut out_file = tempfile().unwrap();
         let mut output = OutputBuffer::new(Box::new(out_file.try_clone().unwrap()));
-        let mut line_reader = LineReader::open(&input_file.path().to_path_buf()).unwrap();
+        let mut line_reader = LineReader::open(&input_file.path().to_path_buf(), b'\n').unwrap();
 
         let mut context = ProcessingContext {
             quiet: true, // Suppress auto-print so only the appended line shows.

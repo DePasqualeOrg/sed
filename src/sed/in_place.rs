@@ -32,6 +32,7 @@ pub struct InPlace {
     pub follow_symlinks: bool,
     pub temp_file: Option<NamedTempFile>,
     pub original_path: Option<PathBuf>,
+    pub separator: u8,
 }
 
 impl InPlace {
@@ -40,7 +41,8 @@ impl InPlace {
     /// editing, backup the original file, or follow symlinks.
     pub fn new(context: ProcessingContext) -> Self {
         Self {
-            output: OutputBuffer::new(Box::new(stdout())),
+            output: OutputBuffer::new(Box::new(stdout())).with_separator(context.separator()),
+            separator: context.separator(),
             in_place: context.in_place,
             in_place_suffix: context.in_place_suffix,
             follow_symlinks: context.follow_symlinks,
@@ -67,7 +69,7 @@ impl InPlace {
     /// to the context settings.
     fn begin_resolved(&mut self, file_name: &Path) -> UResult<&mut OutputBuffer> {
         if !self.in_place {
-            self.output = OutputBuffer::new(Box::new(stdout()));
+            self.output = OutputBuffer::new(Box::new(stdout())).continuing(&self.output);
             return Ok(&mut self.output);
         }
 
@@ -104,7 +106,8 @@ impl InPlace {
 
         let output = OutputBuffer::new(Box::new(
             temp_file.reopen().expect("reopening NamedTempFile"),
-        ));
+        ))
+        .with_separator(self.separator);
         self.output = output;
         self.temp_file = Some(temp_file);
         self.original_path = Some(file_name.to_path_buf());

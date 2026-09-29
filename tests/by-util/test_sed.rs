@@ -1432,7 +1432,7 @@ fn test_uppercase_delete_prevents_automatic_printing() {
         .args(&["-e", "N", "-e", "D"])
         .pipe_in("line1\nline2\nline3")
         .succeeds()
-        .stdout_is("line3\n");
+        .stdout_is("line3");
 }
 
 ////////////////////////////////////////////////////////////
@@ -3089,4 +3089,149 @@ fn test_posix_reject_flags() {
         .fails()
         .code_is(1)
         .stderr_is("sed: <script argument 1>:1:7: error: unknown option to 's'\n");
+}
+
+////////////////////////////////////////////////////////////
+// Null data (-z)
+
+/// With -z, NUL separates lines, and a newline is an ordinary character.
+#[test]
+fn null_data_separates_lines_with_nul() {
+    let cases: &[(&[&str], &[u8], &[u8])] = &[
+        (&["s/\\n/,/g"], b"a\nb\n", b"a,b,"),
+        (&["p"], b"a\nb\0c", b"a\nb\0a\nb\0c\0c"),
+        (&["="], b"a\0", b"1\0a\0"),
+        (&["$!N;s/\\x00/+/"], b"a\0b\0c\0", b"a+b\0c\0"),
+        (&["N;P;d"], b"a\nb\0c\0", b"a\nb\0"),
+        (&["$!N;P;D"], b"a\nx\0b\0", b"a\nx\0b\0"),
+        (&["G"], b"a\0", b"a\0\0"),
+        (&["H;$!d;x"], b"a\0b\0", b"\0a\0b\0"),
+        (&["-n", "l"], b"a\nb\0", b"a\\nb$\0"),
+        (&["-n", "l 4"], b"abcdef\0", b"abc\\\0def$\0"),
+        (&["1i X"], b"a\0", b"X\0a\0"),
+        // As in GNU sed, appended text keeps its newline.
+        (&["1a X"], b"a\0", b"a\0X\n"),
+        (&["N"], b"a\0b\0c", b"a\0b\0c"),
+    ];
+    for (args, input, expected) in cases {
+        new_ucmd!()
+            .arg("-z")
+            .args(args)
+            .pipe_in(*input)
+            .succeeds()
+            .stdout_is_bytes(expected);
+    }
+}
+
+/// With -z, input files, `R` and `w` files, and in-place edits use NUL lines.
+#[test]
+fn null_data_files() -> std::io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let input = dir.path().join("input");
+    let lines = dir.path().join("lines");
+    let written = dir.path().join("written");
+    fs::write(&input, b"a\nb\0c\0")?;
+    fs::write(&lines, b"x\0y\0")?;
+
+    new_ucmd!()
+        .arg("-z")
+        .args(&["-e", &format!("R {}", lines.display())])
+        .args(&["-e", &format!("w {}", written.display())])
+        .arg(&input)
+        .succeeds()
+        .stdout_is_bytes(b"a\nb\0x\0c\0y\0");
+    assert_eq!(fs::read(&written)?, b"a\nb\0c\0");
+
+    new_ucmd!()
+        .args(&["-z", "-i", "-e", "s/b$/B/"])
+        .arg(&input)
+        .succeeds();
+    assert_eq!(fs::read(&input)?, b"a\nB\0c\0");
+    Ok(())
+}
+
+/// A separator that a file's last line lacks is written before the next
+/// file's output, both to standard output and to `w` files.
+#[test]
+fn missing_separator_is_written_between_files() -> std::io::Result<()> {
+    type Case = (&'static [&'static str], &'static str, [&'static [u8]; 3]);
+    let dir = tempfile::tempdir()?;
+    let cases: &[Case] = &[
+        (&["-z"], "", [b"a\0b", b"c\0d", b"a\0b\0c\0d"]),
+        (&[], "", [b"e\nf", b"g\nh", b"e\nf\ng\nh"]),
+        (&[], "2Q;", [b"x", b"y", b"x"]),
+    ];
+    for (flags, script, [first, second, expected]) in cases {
+        let (one, two, out) = (
+            dir.path().join("1"),
+            dir.path().join("2"),
+            dir.path().join("out"),
+        );
+        fs::write(&one, first)?;
+        fs::write(&two, second)?;
+        new_ucmd!()
+            .args(flags)
+            .arg(format!("{script}w {}", out.display()))
+            .arg(&one)
+            .arg(&two)
+            .succeeds()
+            .stdout_is_bytes(expected);
+        assert_eq!(fs::read(&out)?, *expected, "{flags:?} {script}");
+    }
+    Ok(())
+}
+
+/// GNU sed also accepts `--zero-terminated` for `-z`.
+#[test]
+fn null_data_zero_terminated_alias() {
+    new_ucmd!()
+        .args(&["--zero-terminated", "="])
+        .pipe_in(b"a\0".as_slice())
+        .succeeds()
+        .stdout_is_bytes(b"1\0a\0");
+}
+
+/// With -z, the `e` flag strips a trailing NUL, not a newline, from the output.
+#[cfg(unix)]
+#[test]
+fn null_data_execute_flag_strips_nul() {
+    new_ucmd!()
+        .args(&["-z", r#"s/.*/printf 'X\\n\\0'/e"#])
+        .pipe_in(b"a\0".as_slice())
+        .succeeds()
+        .stdout_is_bytes(b"X\n\0");
+}
+
+/// `N` at the end of input prints a last line lacking a newline unchanged.
+#[test]
+fn next_line_at_end_keeps_missing_newline() {
+    new_ucmd!()
+        .arg("N")
+        .pipe_in("a\nb\nc")
+        .succeeds()
+        .stdout_is("a\nb\nc");
+}
+
+/// `R` copies a line lacking a newline unchanged, as GNU sed does.
+#[test]
+fn read_one_line_without_newline_is_copied_unchanged() -> std::io::Result<()> {
+    let temp = NamedTempFile::new()?;
+    fs::write(temp.path(), "x")?;
+    new_ucmd!()
+        .arg(format!("R {}", temp.path().display()))
+        .pipe_in("a\nb\n")
+        .succeeds()
+        .stdout_is("a\nxb\n");
+    Ok(())
+}
+
+/// The output of the `e` command is copied unchanged, as GNU sed does.
+#[cfg(unix)]
+#[test]
+fn execute_command_output_is_copied_unchanged() {
+    new_ucmd!()
+        .arg("1e printf hi")
+        .pipe_in("a\nb\n")
+        .succeeds()
+        .stdout_is("hia\nb\n");
 }

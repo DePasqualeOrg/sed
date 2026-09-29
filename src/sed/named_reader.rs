@@ -40,9 +40,9 @@ impl NamedReader {
         }))
     }
 
-    /// Return the next line of the file, including its trailing newline if
-    /// present, or `None` once the file is exhausted or could not be read.
-    pub fn next_line(&mut self) -> Option<Vec<u8>> {
+    /// Return the next line of the file, including its trailing `separator`
+    /// if present, or `None` once the file is exhausted or could not be read.
+    pub fn next_line(&mut self, separator: u8) -> Option<Vec<u8>> {
         if matches!(self.state, State::Unopened) {
             self.state = match File::open(&self.path) {
                 Ok(file) => State::Open(BufReader::new(file)),
@@ -55,7 +55,7 @@ impl NamedReader {
         };
 
         let mut line = Vec::new();
-        match reader.read_until(b'\n', &mut line) {
+        match reader.read_until(separator, &mut line) {
             Ok(0) | Err(_) => {
                 self.state = State::Exhausted;
                 None
@@ -77,10 +77,16 @@ mod tests {
         file.write_all(b"one\ntwo\n").unwrap();
         let reader = NamedReader::new(file.path().to_path_buf());
 
-        assert_eq!(reader.borrow_mut().next_line(), Some(b"one\n".to_vec()));
-        assert_eq!(reader.borrow_mut().next_line(), Some(b"two\n".to_vec()));
-        assert_eq!(reader.borrow_mut().next_line(), None);
-        assert_eq!(reader.borrow_mut().next_line(), None);
+        assert_eq!(
+            reader.borrow_mut().next_line(b'\n'),
+            Some(b"one\n".to_vec())
+        );
+        assert_eq!(
+            reader.borrow_mut().next_line(b'\n'),
+            Some(b"two\n".to_vec())
+        );
+        assert_eq!(reader.borrow_mut().next_line(b'\n'), None);
+        assert_eq!(reader.borrow_mut().next_line(b'\n'), None);
     }
 
     #[test]
@@ -89,13 +95,13 @@ mod tests {
         file.write_all(b"abc").unwrap();
         let reader = NamedReader::new(file.path().to_path_buf());
 
-        assert_eq!(reader.borrow_mut().next_line(), Some(b"abc".to_vec()));
-        assert_eq!(reader.borrow_mut().next_line(), None);
+        assert_eq!(reader.borrow_mut().next_line(b'\n'), Some(b"abc".to_vec()));
+        assert_eq!(reader.borrow_mut().next_line(b'\n'), None);
     }
 
     #[test]
     fn missing_file_yields_no_lines() {
         let reader = NamedReader::new(PathBuf::from("/nonexistent/xyzzy-42-does-not-exist"));
-        assert_eq!(reader.borrow_mut().next_line(), None);
+        assert_eq!(reader.borrow_mut().next_line(b'\n'), None);
     }
 }

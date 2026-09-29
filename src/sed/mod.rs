@@ -245,6 +245,7 @@ pub fn uu_app() -> Command {
             Arg::new("null-data")
                 .short('z')
                 .long("null-data")
+                .alias("zero-terminated")
                 .help("Separate lines by NUL characters.")
                 .action(clap::ArgAction::SetTrue),
         ])
@@ -383,6 +384,7 @@ fn build_context(matches: &ArgMatches) -> UResult<ProcessingContext> {
         last_line: false,
         last_file: false,
         stop_processing: false,
+        quit_silently: false,
         saved_regex: None,
         input_action: None,
         hold: ByteSpace {
