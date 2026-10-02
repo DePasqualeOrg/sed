@@ -57,11 +57,6 @@ impl NamedWriter {
         Ok(writer)
     }
 
-    /// Write String to the file, possibly with a newline, returning errors.
-    pub fn write_line(&mut self, line: &str, newline: bool) -> UResult<()> {
-        self.write_line_bytes(line.as_bytes(), b'\n', newline)
-    }
-
     /// Write bytes to the file, possibly followed by `separator`, returning
     /// errors. A missing separator is written before any further line.
     pub fn write_line_bytes(

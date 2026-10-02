@@ -725,7 +725,8 @@ impl OutputBuffer {
         self.out.write_all(bytes)
     }
 
-    /// Copy the specified file to the output.
+    /// Copy the specified file to the output. A separator deferred by an
+    /// earlier write stays deferred; callers write it first when needed.
     pub fn copy_file(&mut self, path: &PathBuf) -> io::Result<()> {
         // Flush mmap writes, if any.
         #[cfg(unix)]
@@ -745,6 +746,7 @@ impl OutputBuffer {
 }
 
 /// Implementation of the std::io::Write trait
+// Like `write_bytes`, each call turns a trailing \n into the line separator.
 impl Write for OutputBuffer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.write_bytes(buf)?;
