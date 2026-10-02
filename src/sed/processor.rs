@@ -472,6 +472,9 @@ fn flush_appends(output: &mut OutputBuffer, context: &mut ProcessingContext) -> 
                 output.write_raw(text.as_ref())?;
             }
             AppendElement::Path(path) => {
+                // As in GNU sed, end a line that lacks its separator first,
+                // even when the file is empty or unreadable.
+                output.flush_pending_newline()?;
                 output.copy_file(path)?;
             }
         }
@@ -832,6 +835,8 @@ fn process_file(
                     context.stop_processing = true;
                     context.quit_silently = true;
                     context.quiet = true;
+                    // Like GNU sed, discard text queued by `a`, `r` and `R`.
+                    context.append_elements.clear();
                     break;
                 }
                 'R' => {

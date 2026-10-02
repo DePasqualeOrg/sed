@@ -81,5 +81,7 @@ that aren't compatible with GNU sed or POSIX.
   one are empty, then the last line condition will never be triggered.
   This behavior is consistent with the
   [original implementation](https://github.com/dspinellis/unix-history-repo/blob/Research-V7/usr/src/cmd/sed/sed1.c#L665).
+* With `-z`, the `M` flag still makes `^` and `$` match at newlines,
+  whereas GNU _sed_ makes them match at NUL characters.
 * Labels are parsed for alphanumeric characters. The BSD version parses them
   until the end of the line, preventing ; to be used as a separator.

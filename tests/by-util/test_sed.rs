@@ -3081,6 +3081,7 @@ fn missing_separator_is_written_between_files() -> std::io::Result<()> {
     let cases: &[Case] = &[
         (&["-z"], "", [b"a\0b", b"c\0d", b"a\0b\0c\0d"]),
         (&[], "", [b"e\nf", b"g\nh", b"e\nf\ng\nh"]),
+        (&["-s"], "", [b"e\nf", b"g\nh", b"e\nf\ng\nh"]),
         (&[], "2Q;", [b"x", b"y", b"x"]),
     ];
     for (flags, script, [first, second, expected]) in cases {
@@ -3100,6 +3101,107 @@ fn missing_separator_is_written_between_files() -> std::io::Result<()> {
             .stdout_is_bytes(expected);
         assert_eq!(fs::read(&out)?, *expected, "{flags:?} {script}");
     }
+    Ok(())
+}
+
+/// With -i, a separator missing at the end of one file is not written to the
+/// next file.
+#[test]
+fn in_place_keeps_missing_separator_per_file() -> std::io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (one, two) = (dir.path().join("1"), dir.path().join("2"));
+    for (flags, [first, second], expected) in [
+        (&[][..], ["a", "b\n"], ["A", "b\n"]),
+        (&["-z"][..], ["a\0b", "c"], ["A\0b", "c"]),
+    ] {
+        fs::write(&one, first)?;
+        fs::write(&two, second)?;
+        new_ucmd!()
+            .args(flags)
+            .args(&["-i", "-e", "s/a/A/"])
+            .arg(&one)
+            .arg(&two)
+            .succeeds();
+        assert_eq!(fs::read_to_string(&one)?, expected[0], "{flags:?}");
+        assert_eq!(fs::read_to_string(&two)?, expected[1], "{flags:?}");
+    }
+    Ok(())
+}
+
+/// `r` first writes a separator that the line lacks, even when the file is
+/// missing, and then copies the file unchanged, as GNU sed does.
+#[test]
+fn read_file_after_line_without_separator() -> std::io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (one, two, text) = (
+        dir.path().join("1"),
+        dir.path().join("2"),
+        dir.path().join("text"),
+    );
+    fs::write(&one, "a")?;
+    for (flags, text_content, second, expected) in [
+        (&[][..], "X\nY", "b\n", "a\nX\nYb\n"),
+        (&["-z"][..], "X\0", "b\0", "a\0X\0b\0"),
+    ] {
+        fs::write(&text, text_content)?;
+        fs::write(&two, second)?;
+        new_ucmd!()
+            .args(flags)
+            .arg(format!("1r {}", text.display()))
+            .arg(&one)
+            .arg(&two)
+            .succeeds()
+            .stdout_is(expected);
+    }
+
+    new_ucmd!()
+        .arg(format!("r {}", dir.path().join("missing").display()))
+        .pipe_in("x")
+        .succeeds()
+        .stdout_is("x\n");
+
+    // `0r` at the start of the next file leaves the separator for that
+    // file's first line, as in GNU sed.
+    fs::write(&text, "X\nY")?;
+    fs::write(&two, "b\n")?;
+    new_ucmd!()
+        .args(&["-s", &format!("0r {}", text.display())])
+        .arg(&one)
+        .arg(&two)
+        .succeeds()
+        .stdout_is("X\nYaX\nY\nb\n");
+    Ok(())
+}
+
+/// `Q` discards text queued by `a`, `r` and `R`, as GNU sed does.
+#[test]
+fn quit_silently_discards_appended_text() -> std::io::Result<()> {
+    new_ucmd!()
+        .args(&["-e", "a A", "-e", "Q"])
+        .pipe_in("x\n")
+        .succeeds()
+        .stdout_is("");
+
+    let dir = tempfile::tempdir()?;
+    let (one, two, text) = (
+        dir.path().join("1"),
+        dir.path().join("2"),
+        dir.path().join("text"),
+    );
+    fs::write(&one, "a")?;
+    fs::write(&two, "b\n")?;
+    fs::write(&text, "X\n")?;
+    new_ucmd!()
+        .args(&["-e", &format!("R {}", text.display()), "-e", "Q"])
+        .pipe_in("x\n")
+        .succeeds()
+        .stdout_is("");
+    new_ucmd!()
+        .args(&["-e", &format!("2r {}", text.display()), "-e", "2Q"])
+        .arg(&one)
+        .arg(&two)
+        .succeeds()
+        .stdout_is("a");
     Ok(())
 }
 
