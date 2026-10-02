@@ -603,7 +603,7 @@ pub struct OutputBuffer {
     mmap_chunk: Option<MmapOutput>, // Chunk to write
     // True when the last write didn't end with the separator; it is deferred
     // so that commands like `p` don't emit a spurious newline under -n.
-    pending_newline: bool,
+    pub pending_newline: bool,
     separator: u8, // Line terminator: \n, or \0 with -z
     #[cfg(test)]
     low_level_flushes: usize, // Number of system call flushes
@@ -671,15 +671,6 @@ impl OutputBuffer {
         self
     }
 
-    /// Continue the output of `previous`, which wrote to the same stream,
-    /// including a separator it deferred.
-    #[must_use]
-    pub fn continuing(mut self, previous: &Self) -> Self {
-        self.separator = previous.separator;
-        self.pending_newline = previous.pending_newline;
-        self
-    }
-
     /// Schedule the specified String or &str for eventual output.
     /// A trailing \n stands for the line separator.
     pub fn write_str<S: Into<String>>(&mut self, s: S) -> io::Result<()> {
@@ -721,11 +712,14 @@ impl OutputBuffer {
         self.out.write_all(bytes)
     }
 
-    /// Copy the specified file to the output, after any deferred newline.
-    pub fn copy_file(&mut self, path: &PathBuf) -> io::Result<()> {
-        // As in GNU sed, write the deferred newline even when the file is
-        // empty or cannot be read.
-        self.write_raw(b"")?;
+    /// Copy the specified file to the output. A separator deferred by an
+    /// earlier write stays deferred; callers write it first when needed.
+    pub fn copy_file(&mut self, path: &PathBuf, after_newline: bool) -> io::Result<()> {
+        if after_newline {
+            self.flush_pending_newline()?;
+        }
+        #[cfg(unix)]
+        self.flush_mmap(WriteRange::Complete)?;
 
         let Ok(file) = File::open(path) else {
             // Per POSIX, if the file can't be read treat it as empty.
@@ -739,6 +733,7 @@ impl OutputBuffer {
 }
 
 /// Implementation of the std::io::Write trait
+// Like `write_bytes`, each call turns a trailing \n into the line separator.
 impl Write for OutputBuffer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.write_bytes(buf)?;

@@ -57,11 +57,6 @@ impl NamedWriter {
         Ok(writer)
     }
 
-    /// Write String to the file, possibly with a newline, returning errors.
-    pub fn write_line(&mut self, line: &str, newline: bool) -> UResult<()> {
-        self.write_line_bytes(line.as_bytes(), b'\n', newline)
-    }
-
     /// Write bytes to the file, possibly followed by `separator`, returning
     /// errors. A missing separator is written before any further line.
     pub fn write_line_bytes(
@@ -70,9 +65,6 @@ impl NamedWriter {
         separator: u8,
         terminated: bool,
     ) -> UResult<()> {
-        if line.is_empty() && !terminated {
-            return Ok(());
-        }
         let pending = std::mem::replace(&mut self.pending_separator, !terminated);
         let writer = &mut self.writer;
         (|| -> io::Result<()> {

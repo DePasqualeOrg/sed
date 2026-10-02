@@ -481,7 +481,7 @@ fn flush_appends(output: &mut OutputBuffer, context: &mut ProcessingContext) -> 
                 output.write_raw(text.as_ref())?;
             }
             AppendElement::Path(path) => {
-                output.copy_file(path)?;
+                output.copy_file(path, true)?;
             }
         }
     }
@@ -648,7 +648,7 @@ fn process_address_0(
                     && cmd.addr2.is_none()
                 {
                     let path = extract_variant!(cmd, Path);
-                    output.copy_file(path)?;
+                    output.copy_file(path, false)?;
                 }
 
                 cmd.next.clone()
@@ -677,7 +677,11 @@ fn process_file(
         let mut current: Option<Rc<RefCell<Command>>> =
             if let Some(action) = context.input_action.take() {
                 // Continue processing the `N` or `n` command.
-                if let NextLine::Append { contents: mut combined_lines, .. } = action.next_line {
+                if let NextLine::Append {
+                    contents: mut combined_lines,
+                    ..
+                } = action.next_line
+                {
                     combined_lines.push(context.separator());
                     combined_lines.extend_from_slice(pattern.as_bytes());
 
@@ -984,7 +988,10 @@ fn process_file(
     // Take them even with -n, so that they do not carry over to the next file.
     if context.separate
         && let Some(action) = context.input_action.take()
-        && let NextLine::Append { contents: pending, terminated } = action.next_line
+        && let NextLine::Append {
+            contents: pending,
+            terminated,
+        } = action.next_line
         && !context.quiet
     {
         let pending = IOChunk::from_bytes(pending, terminated);
@@ -1040,7 +1047,10 @@ pub fn process_all_files(
             && !context.separate
             && !context.quiet
             && let Some(action) = context.input_action.take()
-            && let NextLine::Append { contents: pending, terminated } = action.next_line
+            && let NextLine::Append {
+                contents: pending,
+                terminated,
+            } = action.next_line
         {
             let pending = IOChunk::from_bytes(pending, terminated);
             write_chunk(output, context, &pending)?;
